@@ -1,86 +1,87 @@
 """
-FEMB PCB Layout Visualizer
-Reads footprint library + PCB ASC, renders actual-size pad layout.
+FEMB PCB Layout Viewer — interactive dual-side viewer.
+
 Usage:
-  python layout_viz.py               # all components
-  python layout_viz.py --layer UJP   # only U/J/P
-  python layout_viz.py --layer RC    # only R/C
-  python layout_viz.py --layer all   # all (default)
+  python3 layout_viz.py               # interactive, all components
+  python3 layout_viz.py --layer UJP   # only U/J/P
+  python3 layout_viz.py --layer RC    # only R/C
+  python3 layout_viz.py --save        # save PNG snapshots and exit
+
+Controls:
+  [⟳ Flip Board] button  — toggle front / back view
+  Radio buttons          — All / U·J·P / R·C filter
 """
 
-import re, math, sys, argparse
+import re, math, argparse
 from pathlib import Path
+
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyBboxPatch, Rectangle, Circle
+from matplotlib.patches import Rectangle
 from matplotlib.transforms import Affine2D
-import numpy as np
+from matplotlib.widgets import Button, RadioButtons
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-BASE = Path(__file__).parent / "FEMB_PADS_EXPORT"
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths & scale
+# ─────────────────────────────────────────────────────────────────────────────
+BASE     = Path(__file__).parent / "FEMB_PADS_EXPORT"
 LIB_FILE = BASE / "07_libraries/footprints/footprints_from_pcb_ascii_source.asc"
 PCB_FILE = BASE / "02_pcb/pcb_ascii/pcb_layout_ascii.asc"
 
-SCALE = 1 / 1_500_000   # PADS internal units → mm (1mm = 1,500,000 units)
+SCALE = 1 / 1_500_000          # PADS internal units → mm  (1 mm = 1 500 000 units)
 
-# ---------------------------------------------------------------------------
-# Color map by component class
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Colours  (white-background theme)
+# ─────────────────────────────────────────────────────────────────────────────
+BG_FIG   = "#ffffff"
+BG_AXES  = "#f5f5f5"
+GHOST_C  = "#aaaaaa"           # ghost outline colour
+
 COMP_COLORS = {
-    "coldata":  "#e53935",   # red
-    "larasic":  "#1565c0",   # blue
-    "coldadc":  "#2e7d32",   # green
-    "ldo":      "#f57f17",   # amber
-    "switch":   "#6a1b9a",   # purple
-    "connector":"#00838f",   # teal
-    "passive":  "#78909c",   # grey-blue
-    "other":    "#455a64",
+    "coldata":   "#c62828",    # deep red
+    "larasic":   "#1565c0",    # deep blue
+    "coldadc":   "#8e24aa",    # purple
+    "ldo":       "#e65100",    # burnt orange
+    "switch":    "#6a1b9a",    # purple
+    "connector": "#00695c",    # dark teal
+    "passive":   "#90a4ae",    # blue-grey
+    "other":     "#78909c",
 }
 
-def classify(refdes, parttype):
+def classify(parttype):
     fp = parttype.upper()
-    if fp in ("IC_COLDDATA_P3", "LQFP216L"):
-        return "coldata"
-    if fp in ("LAR_ASIC_P4",):
-        return "larasic"
-    if fp in ("COLD_ADC_P2",):
-        return "coldadc"
-    if fp in ("TPS74201",):
-        return "ldo"
-    if fp in ("NLASB3157", "SC-88"):
-        return "switch"
-    if fp in ("SSW-132-21-G-T", "0757830132", "IPL1-108-01-L-D-RE1-K",
-              "FIDUCIAL", "MTG125/250", "MTG125/250A", "MTG125/250B", "MTBLOCK"):
-        return "connector"
-    if fp in ("CC0603","CC0402","CC0805","CC1210","CR0603","CR0402","CR1206",
-              "55081803400","SOT23","TESTPAD","QFN20","LQFP128","LQFP216L","SC-88"):
-        return "passive"
-    return "other"
+    if "COLDDATA"  in fp or "LQFP216" in fp: return "coldata"
+    if "LAR_ASIC"  in fp:                     return "larasic"
+    if "COLD_ADC"  in fp:                     return "coldadc"
+    if "TPS74201"  in fp:                     return "ldo"
+    if "NLASB"     in fp or "SC-88" in fp:    return "switch"
+    if any(x in fp for x in ("MTG","MTBLOCK")): return "mechanical"
+    if any(x in fp for x in
+           ("SSW","0757","IPL1","FIDUCIAL")): return "connector"
+    return "passive"
 
-# ---------------------------------------------------------------------------
-# Parse footprint library → {name: {"outline": [...polygons...], "pads": [...]}}
-# pad entry: {"pin": int, "x": float_mm, "y": float_mm, "w": float_mm, "h": float_mm, "ori": float_deg}
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Parse footprint library → {decal_name: {outline, pads}}
+# ─────────────────────────────────────────────────────────────────────────────
 
-def parse_decal_block(block_lines):
-    """Parse one PARTDECAL block, return (outline_polys, pads)."""
-    outline_polys = []   # list of (points_mm, level)
-    pads = []
+def _parse_decal_block(lines):
+    """Return (outline_polys, pads) for one PARTDECAL block.
 
+    outline_polys : list of ([(x,y)…], level_int)   — all mm, local coords
+    pads          : list of {pin, x, y, w, h, ori}  — all mm, local coords
+    """
+    outlines, pads = [], []
     i = 0
-    lines = block_lines
-
-    # ---- graphics (OPEN/CLOSED/CIRCLE) ----
     while i < len(lines):
         l = lines[i].strip()
-        if re.match(r'^(OPEN|CLOSED)\s+\d+', l):
-            m = re.match(r'^(OPEN|CLOSED)\s+(\d+)\s+\d+\s+\d+\s+(\d+)', l)
-            n_pts = int(m.group(2)) if m else 0
-            level = int(m.group(3)) if m else 0
+
+        # OPEN / CLOSED polygon
+        m = re.match(r'^(OPEN|CLOSED)\s+(\d+)\s+\d+\s+\d+\s+(\d+)', l)
+        if m:
+            n, level = int(m.group(2)), int(m.group(3))
             pts = []
-            for j in range(n_pts):
+            for _ in range(n):
                 i += 1
                 if i < len(lines):
                     xy = lines[i].split()
@@ -89,93 +90,65 @@ def parse_decal_block(block_lines):
                             pts.append((int(xy[0]) * SCALE, int(xy[1]) * SCALE))
                         except ValueError:
                             pass
-            outline_polys.append((pts, level))
-        elif re.match(r'^T(-?\d+)\s+(-?\d+)', l):
-            # terminal: T XLOC YLOC NMXLOC NMYLOC PINNUMBER
-            m = re.match(r'^T(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)', l)
-            if m:
-                tx = int(m.group(1)) * SCALE
-                ty = int(m.group(2)) * SCALE
-                pin = int(m.group(5))
-                # read following PAD definition
-                pad_w, pad_h, pad_ori = 0.5, 0.5, 0.0   # defaults
-                if i + 1 < len(lines) and lines[i+1].startswith('PAD'):
-                    pad_line = lines[i+2] if i+2 < len(lines) else ""
-                    pm = re.match(r'^\s*-?\d+\s+(\d+)\s+RF?\s+([\d.]+)\s+(\d+)', pad_line)
-                    if pm:
-                        pad_w = int(pm.group(1)) * SCALE
-                        pad_ori = float(pm.group(2))
-                        pad_h = int(pm.group(3)) * SCALE
-                    else:
-                        pm2 = re.match(r'^\s*-?\d+\s+(\d+)\s+[SR]', pad_line)
-                        if pm2:
-                            pad_w = int(pm2.group(1)) * SCALE
-                            pad_h = pad_w
-                pads.append({"pin": pin, "x": tx, "y": ty,
-                             "w": pad_w, "h": pad_h, "ori": pad_ori})
-        elif l.startswith("VALUE") or l.startswith("Regular"):
-            pass  # skip text labels
+            if pts:
+                outlines.append((pts, level))
+            i += 1
+            continue
+
+        # Terminal  →  T<XLOC> <YLOC> <NMXLOC> <NMYLOC> <PIN>
+        tm = re.match(r'^T(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)', l)
+        if tm:
+            tx, ty, pin = int(tm.group(1))*SCALE, int(tm.group(2))*SCALE, int(tm.group(5))
+            pw, ph, pori = 0.4, 0.4, 0.0
+            if i+1 < len(lines) and lines[i+1].strip().startswith('PAD'):
+                sl = lines[i+2].strip() if i+2 < len(lines) else ""
+                rfm = re.match(r'-?\d+\s+(\d+)\s+RF\s+([\d.]+)\s+(\d+)', sl)
+                if rfm:
+                    pw, pori, ph = int(rfm.group(1))*SCALE, float(rfm.group(2)), int(rfm.group(3))*SCALE
+                else:
+                    sm = re.match(r'-?\d+\s+(\d+)\s+[SR]', sl)
+                    if sm:
+                        pw = ph = int(sm.group(1)) * SCALE
+            pads.append({"pin": pin, "x": tx, "y": ty, "w": pw, "h": ph, "ori": pori})
         i += 1
-
-    return outline_polys, pads
-
-
-def parse_parttypes(pcb_path):
-    """Return dict: parttype_name → decal_name from *PARTTYPE* section."""
-    text = pcb_path.read_text(errors='replace')
-    pt_start = text.index('*PARTTYPE*')
-    part_start = text.index('*PART*')
-    pt_section = text[pt_start:part_start]
-    types = r'(CAP|RES|DIO|CON|UND|IND|FID|QFP|TTL|HOL)'
-    mapping = {}
-    for m in re.finditer(rf'^(\S+)\s+(\S+)\s+{types}', pt_section, re.MULTILINE):
-        mapping[m.group(1)] = m.group(2)
-    return mapping
+    return outlines, pads
 
 
 def parse_library(lib_path):
-    """Return dict: footprint_name → {"outline": polys, "pads": [pad_dicts]}"""
     text = lib_path.read_text(errors='replace')
-    # Find PARTDECAL section
     m = re.search(r'\*PARTDECAL\*.*?\n', text)
     if not m:
         return {}
-    decal_section = text[m.end():]
-    m2 = re.search(r'\*PARTTYPE\*', decal_section)
+    sec = text[m.end():]
+    m2 = re.search(r'\*PARTTYPE\*', sec)
     if m2:
-        decal_section = decal_section[:m2.start()]
-
-    # Split into per-decal blocks
-    header_pat = re.compile(r'^([A-Z0-9_.:/ -]+?)\s+[IM]\s+\d+', re.MULTILINE)
-    headers = list(header_pat.finditer(decal_section))
-
+        sec = sec[:m2.start()]
+    headers = list(re.finditer(r'^([A-Z0-9_.:/\-]+)\s+[IM]\s+\d+', sec, re.MULTILINE))
     result = {}
     for k, hdr in enumerate(headers):
-        name = hdr.group(1).strip()
+        name  = hdr.group(1).strip()
         start = hdr.end()
-        end = headers[k+1].start() if k+1 < len(headers) else len(decal_section)
-        block_lines = decal_section[start:end].split('\n')
-        outlines, pads = parse_decal_block(block_lines)
+        end   = headers[k+1].start() if k+1 < len(headers) else len(sec)
+        outlines, pads = _parse_decal_block(sec[start:end].split('\n'))
         result[name] = {"outline": outlines, "pads": pads}
-
     return result
 
 
-# ---------------------------------------------------------------------------
-# Parse *PART* section → list of component placements
-# ---------------------------------------------------------------------------
+def parse_parttypes(pcb_path):
+    text = pcb_path.read_text(errors='replace')
+    sec  = text[text.index('*PARTTYPE*'):text.index('*PART*')]
+    pat  = r'(CAP|RES|DIO|CON|UND|IND|FID|QFP|TTL|HOL)'
+    return {m.group(1): m.group(2)
+            for m in re.finditer(rf'^(\S+)\s+(\S+)\s+{pat}', sec, re.MULTILINE)}
+
 
 def parse_parts(pcb_path):
-    """Return list of dicts: refdes, parttype, x_mm, y_mm, ori_deg, mirror."""
     text = pcb_path.read_text(errors='replace')
-    part_start = text.index('*PART*')
-    route_start = text.index('*ROUTE*')
-    part_section = text[part_start:route_start]
-
+    sec  = text[text.index('*PART*'):text.index('*ROUTE*')]
     parts = []
     for m in re.finditer(
         r'^([A-Za-z][A-Za-z0-9_]*)\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+([\d.]+)\s+[UG]\s+([NYM])',
-        part_section, re.MULTILINE
+        sec, re.MULTILINE
     ):
         parts.append({
             "refdes":   m.group(1),
@@ -183,183 +156,341 @@ def parse_parts(pcb_path):
             "x":        int(m.group(3)) * SCALE,
             "y":        int(m.group(4)) * SCALE,
             "ori":      float(m.group(5)),
-            "mirror":   m.group(6) in ('Y', 'M'),
+            "is_back":  m.group(6) in ('Y', 'M'),
         })
     return parts
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry — always computed in FRONT-VIEW world coordinates
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Transform a single pad from local → global coordinates
-# ---------------------------------------------------------------------------
-
-def transform_pad(pad, comp_x, comp_y, ori_deg, mirror):
-    """Returns (gx, gy, gw, gh, global_ori_deg) for a pad."""
-    lx, ly = pad["x"], pad["y"]
-    if mirror:
+def _local_to_world(lx, ly, cx, cy, ori_deg, mirror_x):
+    """Rotate (lx,ly) [mirror first if mirror_x] then translate to (cx,cy)."""
+    if mirror_x:
         lx = -lx
-    r = math.radians(ori_deg)
-    gx = comp_x + lx * math.cos(r) - ly * math.sin(r)
-    gy = comp_y + lx * math.sin(r) + ly * math.cos(r)
-    pad_ori = pad["ori"] + ori_deg
-    return gx, gy, pad["w"], pad["h"], pad_ori
+    r   = math.radians(ori_deg)
+    wx  = cx + lx * math.cos(r) - ly * math.sin(r)
+    wy  = cy + lx * math.sin(r) + ly * math.cos(r)
+    return wx, wy
 
 
-def transform_poly(pts, comp_x, comp_y, ori_deg, mirror):
-    """Returns list of (gx, gy) for polygon points."""
-    r = math.radians(ori_deg)
-    result = []
-    for lx, ly in pts:
-        if mirror:
-            lx = -lx
-        gx = comp_x + lx * math.cos(r) - ly * math.sin(r)
-        gy = comp_y + lx * math.sin(r) + ly * math.cos(r)
-        result.append((gx, gy))
-    return result
+def fp_world_pads(fp, cx, cy, ori, is_back):
+    """Front-view world positions for all pads: [(wx,wy,pw,ph,wori), …]"""
+    out = []
+    for p in fp["pads"]:
+        wx, wy = _local_to_world(p["x"], p["y"], cx, cy, ori, is_back)
+        wori   = p["ori"] + (ori if not is_back else -ori)
+        out.append((wx, wy, p["w"], p["h"], wori))
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Draw a single pad as a rectangle on ax
-# ---------------------------------------------------------------------------
-
-LEVEL_OUTLINE = {0, 20, 26}   # levels to draw as courtyard/outline
-
-def draw_pad(ax, gx, gy, w, h, pad_ori_deg, color, alpha=0.85):
-    """Draw a rectangle pad centred at (gx, gy), w×h mm, rotated pad_ori_deg."""
-    if w <= 0 or h <= 0:
-        w = h = 0.3
-    rect = Rectangle((-w/2, -h/2), w, h,
-                     linewidth=0, facecolor=color, alpha=alpha)
-    t = (Affine2D().rotate_deg(pad_ori_deg)
-         .translate(gx, gy) + ax.transData)
-    rect.set_transform(t)
-    ax.add_patch(rect)
-
-
-def draw_outline(ax, pts, color, lw=0.5):
-    if len(pts) < 2:
-        return
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    ax.plot(xs, ys, color=color, linewidth=lw, alpha=0.6)
-
-
-# ---------------------------------------------------------------------------
-# Main render
-# ---------------------------------------------------------------------------
-
-def render(layer="all"):
-    print("Parsing footprint library …")
-    lib = parse_library(LIB_FILE)
-    print(f"  {len(lib)} footprints loaded")
-
-    print("Parsing PARTTYPE → DECAL mapping …")
-    parttype_map = parse_parttypes(PCB_FILE)
-    print(f"  {len(parttype_map)} part types mapped")
-
-    print("Parsing PCB part placements …")
-    parts = parse_parts(PCB_FILE)
-    print(f"  {len(parts)} components loaded")
-
-    # Determine which RefDes prefixes to show
-    prefix_filter = None
-    if layer == "UJP":
-        prefix_filter = {"U", "J", "P"}
-    elif layer == "RC":
-        prefix_filter = {"R", "C"}
-    elif layer == "all":
-        prefix_filter = None
-
-    fig, ax = plt.subplots(figsize=(28, 24))
-    ax.set_aspect('equal')
-    ax.set_facecolor('#1a1a2e')
-    fig.patch.set_facecolor('#0f0f1a')
-
-    comp_count = 0
-    pad_count = 0
-    missing_fp = set()
-
-    for comp in parts:
-        ref = comp["refdes"]
-        prefix = re.match(r'^([A-Za-z]+)', ref).group(1)
-
-        if prefix_filter and prefix not in prefix_filter:
+def fp_world_outlines(fp, cx, cy, ori, is_back, levels=(0, 20, 26)):
+    """Front-view world polygons for selected levels: [[(wx,wy),…],…]"""
+    polys = []
+    for pts, level in fp["outline"]:
+        if level not in levels or len(pts) < 2:
             continue
+        polys.append([_local_to_world(lx, ly, cx, cy, ori, is_back)
+                      for lx, ly in pts])
+    return polys
 
-        fp_name = comp["parttype"]
-        # Resolve via PARTTYPE→DECAL map, fallback to direct name
-        decal_name = parttype_map.get(fp_name, fp_name)
-        fp = lib.get(decal_name) or lib.get(fp_name)
+
+def fp_bbox(fp, cx, cy, ori, is_back):
+    """Bounding box of all outline points (front-view)."""
+    all_xy = [xy for pts, _ in fp["outline"]
+                  for xy in [_local_to_world(lx, ly, cx, cy, ori, is_back)
+                              for lx, ly in pts]]
+    if not all_xy:
+        return cx-.5, cy-.5, cx+.5, cy+.5
+    xs = [p[0] for p in all_xy]; ys = [p[1] for p in all_xy]
+    return min(xs), min(ys), max(xs), max(ys)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# View transform  (apply AFTER computing front-view world coords)
+# When viewing_back: mirror all world X around the board centre
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _flip_pads(pads, board_cx):
+    """Mirror pad world positions in X and negate pad orientation."""
+    return [(2*board_cx - wx, wy, pw, ph, -wori)
+            for wx, wy, pw, ph, wori in pads]
+
+def _flip_polys(polys, board_cx):
+    return [[(2*board_cx - x, y) for x, y in poly] for poly in polys]
+
+def _flip_xy(x, y, board_cx):
+    return 2*board_cx - x, y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drawing primitives
+# ─────────────────────────────────────────────────────────────────────────────
+
+def draw_pad(ax, wx, wy, pw, ph, wori, color, alpha=0.90):
+    if pw <= 0 or ph <= 0:
+        pw = ph = 0.25
+    r = Rectangle((-pw/2, -ph/2), pw, ph,
+                  linewidth=0, facecolor=color, alpha=alpha)
+    r.set_transform(Affine2D().rotate_deg(wori).translate(wx, wy) + ax.transData)
+    ax.add_patch(r)
+
+
+def draw_active(ax, pads_v, polys_v, label_xy, color, label_text):
+    for poly in polys_v:
+        if poly:
+            xs, ys = zip(*poly)
+            ax.plot(xs, ys, color=color, lw=0.6, alpha=0.6)
+    for wx, wy, pw, ph, wori in pads_v:
+        draw_pad(ax, wx, wy, pw, ph, wori, color)
+    if label_text:
+        ax.text(*label_xy, label_text, color='black', fontsize=3.5,
+                ha='center', va='center', fontweight='bold', clip_on=True, zorder=10)
+
+
+def draw_ghost(ax, pads_v, polys_v, bbox_v):
+    """Grey dashed courtyard outline — no pads."""
+    if polys_v:
+        for poly in polys_v:
+            if poly:
+                xs, ys = zip(*poly)
+                ax.plot(xs, ys, color=GHOST_C, lw=1.5,
+                        linestyle='--', alpha=0.55, dash_capstyle='round')
+    else:
+        x0, y0, x1, y1 = bbox_v
+        ax.add_patch(Rectangle((x0, y0), x1-x0, y1-y0,
+                                linewidth=1.5, edgecolor=GHOST_C,
+                                facecolor='none', linestyle='--', alpha=0.45))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build component list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_comp_list(lib, ptmap, parts):
+    comps, missing = [], set()
+    for p in parts:
+        cls = classify(p["parttype"])
+        if cls == "mechanical":
+            continue
+        fp_key = ptmap.get(p["parttype"], p["parttype"])
+        fp = lib.get(fp_key) or lib.get(p["parttype"])
         if fp is None:
-            missing_fp.add(fp_name)
-            continue
+            missing.add(p["parttype"]); continue
+        prefix = re.match(r'^([A-Za-z]+)', p["refdes"]).group(1)
+        comps.append({**p,
+                      "fp":     fp,
+                      "prefix": prefix,
+                      "color":  COMP_COLORS[cls],
+                      "label":  p["refdes"] if prefix in ("U","J","P") else None})
+    if missing:
+        print(f"  No footprint for: {missing}")
+    return comps
 
-        cls = classify(ref, fp_name)
-        color = COMP_COLORS.get(cls, COMP_COLORS["other"])
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive viewer
+# ─────────────────────────────────────────────────────────────────────────────
 
-        cx, cy = comp["x"], comp["y"]
-        ori = comp["ori"]
-        mir = comp["mirror"]
+class PCBViewer:
+    LAYERS = {"All": None, "U/J/P": {"U","J","P"}, "R/C": {"R","C"}}
 
-        # Draw courtyard outline (level 0 or 26)
-        for poly_pts, level in fp["outline"]:
-            if level in (0, 20, 26) and len(poly_pts) >= 2:
-                gpts = transform_poly(poly_pts, cx, cy, ori, mir)
-                draw_outline(ax, gpts, color, lw=0.4)
+    def __init__(self, comps):
+        self.comps_all   = comps
+        self.view_back   = False
+        self.layer_label = "All"
+        self._cache      = {}
 
-        # Draw pads
-        for pad in fp["pads"]:
-            gx, gy, pw, ph, p_ori = transform_pad(pad, cx, cy, ori, mir)
-            draw_pad(ax, gx, gy, pw, ph, p_ori, color)
-            pad_count += 1
+        # board X-centre (for flip transform)
+        xs = [c["x"] for c in comps]
+        self._bcx = (min(xs) + max(xs)) / 2
+        print(f"  Board X range: {min(xs):.1f} … {max(xs):.1f} mm  "
+              f"(centre {self._bcx:.1f} mm)")
 
-        comp_count += 1
+        self._build_figure()
+        self._redraw()
 
-        # Label large components
-        if prefix in ("U", "J", "P"):
-            ax.text(cx, cy, ref, color='white', fontsize=4,
-                    ha='center', va='center',
-                    fontweight='bold', clip_on=True)
+    # ── Figure ────────────────────────────────────────────────────────────────
 
-    print(f"  Rendered {comp_count} components, {pad_count} pads")
-    if missing_fp:
-        print(f"  Missing footprints: {missing_fp}")
+    def _build_figure(self):
+        self.fig = plt.figure(figsize=(26, 20), facecolor=BG_FIG)
+        self.ax  = self.fig.add_axes([0.04, 0.10, 0.92, 0.87])
+        self.ax.set_facecolor(BG_AXES)
+        self.ax.set_aspect('equal')
+        for sp in self.ax.spines.values():
+            sp.set_edgecolor('#cccccc')
+        self.ax.tick_params(colors='#444444')
+        self.ax.xaxis.label.set_color('#444444')
+        self.ax.yaxis.label.set_color('#444444')
+        self.ax.set_xlabel("X (mm)")
+        self.ax.set_ylabel("Y (mm)")
 
-    # Legend
-    legend_items = [
-        mpatches.Patch(color=COMP_COLORS["coldata"],   label="COLDATA (U1,U2)"),
-        mpatches.Patch(color=COMP_COLORS["larasic"],   label="LArASIC ×8"),
-        mpatches.Patch(color=COMP_COLORS["coldadc"],   label="ColdADC ×8"),
-        mpatches.Patch(color=COMP_COLORS["ldo"],       label="TPS74201 LDO ×11"),
-        mpatches.Patch(color=COMP_COLORS["switch"],    label="NLASB3157 ×13"),
-        mpatches.Patch(color=COMP_COLORS["connector"], label="J/P Connectors"),
-        mpatches.Patch(color=COMP_COLORS["passive"],   label="R/C/L/D Passives"),
-    ]
-    ax.legend(handles=legend_items, loc='upper right',
-              facecolor='#1a1a2e', edgecolor='white',
-              labelcolor='white', fontsize=7)
+        # Flip button
+        ax_btn = self.fig.add_axes([0.43, 0.01, 0.14, 0.055])
+        self.btn = Button(ax_btn, '⟳  Flip to Back',
+                          color='#eeeeee', hovercolor='#dddddd')
+        self.btn.label.set_color('#222222')
+        self.btn.label.set_fontsize(9)
+        self.btn.on_clicked(self._on_flip)
 
-    ax.set_xlabel("X (mm)", color='white')
-    ax.set_ylabel("Y (mm)", color='white')
-    ax.tick_params(colors='white')
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#444')
+        # Layer radio
+        ax_rad = self.fig.add_axes([0.01, 0.01, 0.12, 0.08],
+                                   facecolor='#eeeeee')
+        self.radio = RadioButtons(ax_rad, list(self.LAYERS.keys()),
+                                  activecolor='#1565c0')
+        for lbl in self.radio.labels:
+            lbl.set_color('#222222')
+            lbl.set_fontsize(8)
+        self.radio.on_clicked(self._on_layer)
 
-    title_map = {"UJP": "U / J / P", "RC": "R / C", "all": "All"}
-    ax.set_title(f"FEMB PCB Layout — {title_map.get(layer,'?')} (actual pad positions, mm scale)",
-                 color='white', fontsize=11)
+    # ── Events ────────────────────────────────────────────────────────────────
 
-    plt.tight_layout()
+    def _on_flip(self, _):
+        self.view_back = not self.view_back
+        self.btn.label.set_text(
+            '⟳  Flip to Front' if self.view_back else '⟳  Flip to Back')
+        self._redraw()
 
-    out = Path(__file__).parent / f"layout_{layer}.png"
-    fig.savefig(out, dpi=200, bbox_inches='tight',
-                facecolor=fig.get_facecolor())
-    print(f"Saved → {out}")
-    plt.show()
+    def _on_layer(self, lbl):
+        self.layer_label = lbl
+        self._redraw()
 
+    # ── Component filter ──────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
+    def _filtered(self):
+        lbl = self.layer_label
+        if lbl not in self._cache:
+            pf = self.LAYERS[lbl]
+            self._cache[lbl] = (self.comps_all if pf is None
+                                else [c for c in self.comps_all
+                                      if c["prefix"] in pf])
+        return self._cache[lbl]
+
+    # ── Redraw ────────────────────────────────────────────────────────────────
+
+    def _redraw(self):
+        ax   = self.ax
+        ax.cla()
+        ax.set_facecolor(BG_AXES)
+        ax.set_aspect('equal')
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Y (mm)")
+        ax.tick_params(colors='#444444')
+
+        vback = self.view_back
+        bcx   = self._bcx
+
+        for c in self._filtered():
+            fp      = c["fp"]
+            cx, cy  = c["x"], c["y"]
+            ori     = c["ori"]
+            is_back = c["is_back"]
+            color   = c["color"]
+            label   = c["label"]
+
+            # ── Compute FRONT-VIEW world coords (no flip yet) ──────────────
+            pads_fw   = fp_world_pads(fp, cx, cy, ori, is_back)
+            polys_fw  = fp_world_outlines(fp, cx, cy, ori, is_back)
+            bbox_fw   = fp_bbox(fp, cx, cy, ori, is_back)
+            lx_fw, ly = cx, cy
+
+            # ── Apply view transform for back view ─────────────────────────
+            if vback:
+                pads_v  = _flip_pads(pads_fw, bcx)
+                polys_v = _flip_polys(polys_fw, bcx)
+                bbox_v  = (2*bcx - bbox_fw[2], bbox_fw[1],
+                           2*bcx - bbox_fw[0], bbox_fw[3])
+                lx_v    = 2*bcx - lx_fw
+            else:
+                pads_v, polys_v, bbox_v, lx_v = pads_fw, polys_fw, bbox_fw, lx_fw
+
+            # ── Draw: active side = colour, other side = ghost ─────────────
+            active = (is_back == vback)   # component is on the side we're viewing
+            if active:
+                draw_active(ax, pads_v, polys_v, (lx_v, ly), color, label)
+            else:
+                draw_ghost(ax, pads_v, polys_v, bbox_v)
+
+        # Title + legend
+        side = "BACK ◀" if vback else "▶ FRONT"
+        ax.set_title(f"FEMB PCB Layout  —  [{side}]  —  {self.layer_label}",
+                     color='#222222', fontsize=11, pad=8)
+
+        handles = [
+            mpatches.Patch(color=COMP_COLORS["coldata"],   label="COLDATA"),
+            mpatches.Patch(color=COMP_COLORS["larasic"],   label="LArASIC ×8"),
+            mpatches.Patch(color=COMP_COLORS["coldadc"],   label="ColdADC ×8"),
+            mpatches.Patch(color=COMP_COLORS["ldo"],       label="LDO ×11"),
+            mpatches.Patch(color=COMP_COLORS["switch"],    label="Switch ×13"),
+            mpatches.Patch(color=COMP_COLORS["connector"], label="Connector"),
+            mpatches.Patch(color=COMP_COLORS["passive"],   label="Passive"),
+            mpatches.Patch(facecolor='none', edgecolor=GHOST_C,
+                           linestyle='--', linewidth=1.5,
+                           label="Ghost (other side)"),
+        ]
+        ax.legend(handles=handles, loc='upper right', fontsize=7,
+                  facecolor='white', edgecolor='#cccccc',
+                  labelcolor='#222222', framealpha=0.95)
+
+        self.fig.canvas.draw_idle()
+
+    # ── Save PNGs ─────────────────────────────────────────────────────────────
+
+    def save_snapshots(self):
+        base = Path(__file__).parent
+        for tag, back, layer in [
+            ("front", False, "All"),
+            ("back",  True,  "All"),
+            ("front", False, "U/J/P"),
+            ("back",  True,  "U/J/P"),
+        ]:
+            self.view_back   = back
+            self.layer_label = layer
+            self._redraw()
+            out = base / f"layout_{tag}_{layer.replace('/','')}.png"
+            self.fig.savefig(out, dpi=180, bbox_inches='tight',
+                             facecolor=self.fig.get_facecolor())
+            print(f"  Saved → {out}")
+        self.view_back   = False
+        self.layer_label = "All"
+        self._redraw()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--layer", choices=["UJP", "RC", "all"], default="all")
+    parser.add_argument("--layer", choices=["all","UJP","RC"], default="all")
+    parser.add_argument("--save", action="store_true",
+                        help="Save PNG snapshots and exit")
     args = parser.parse_args()
-    render(args.layer)
+
+    if args.save:
+        matplotlib.use('Agg')
+
+    print("Loading footprint library …")
+    lib = parse_library(LIB_FILE)
+    print(f"  {len(lib)} footprints")
+
+    print("Loading PARTTYPE map …")
+    ptmap = parse_parttypes(PCB_FILE)
+
+    print("Loading component placements …")
+    parts = parse_parts(PCB_FILE)
+    print(f"  {len(parts)} placements")
+
+    print("Building component list …")
+    comps = build_comp_list(lib, ptmap, parts)
+    print(f"  {len(comps)} renderable components")
+
+    viewer = PCBViewer(comps)
+
+    layer_map = {"all": "All", "UJP": "U/J/P", "RC": "R/C"}
+    viewer.layer_label = layer_map.get(args.layer, "All")
+    viewer._redraw()
+
+    if args.save:
+        viewer.save_snapshots()
+    else:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
